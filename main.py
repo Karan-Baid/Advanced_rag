@@ -1,18 +1,15 @@
 import streamlit as st
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_cohere import CohereEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain_classic.retrievers import BM25Retriever, EnsembleRetriever
+from langchain_cohere import CohereRerank
 import os
-import getpass
+from collections import defaultdict
 from pydantic import BaseModel
 from typing import List
 
@@ -35,16 +32,15 @@ st.write("Upload Pdf's and chat with their content")
 
 api_key=os.getenv("GROQ_API_KEY")
 
-def reciprocal_rank_fusion(chunks_list,k=60,verbose=True):
+def reciprocal_rank_fusion(chunks_list,k=60):
     rrf_scores=defaultdict(float)
     all_unique_chunks={}
-
     chunk_id_map={}
-    chunk_counter= 1
+    chunk_counter=1
 
     for query_idx,chunks in enumerate(chunks_list,1):
         for position,chunk in enumerate(chunks,1):
-            chunk_content= chunk.page_content
+            chunk_content=chunk.page_content
             if chunk_content not in chunk_id_map:
                 chunk_id_map[chunk_content]=f"Chunk_{chunk_counter}"
                 chunk_counter+=1
@@ -53,11 +49,15 @@ def reciprocal_rank_fusion(chunks_list,k=60,verbose=True):
             position_score=1/(k+position)
             rrf_scores[chunk_id]+=position_score
 
+    id_to_content={chunk_id:content for content,chunk_id in chunk_id_map.items()}
+    
     sorted_chunks=sorted(
-        [(all_unique_chunks[chunk_content],score) for chunk_content,score in rrf_scores.items()],key=lambda x:x[1],
+        [(all_unique_chunks[id_to_content[chunk_id]],score) for chunk_id,score in rrf_scores.items()],
+        key=lambda x:x[1],
         reverse=True
     )
-    return sorted_chunks   
+    
+    return [doc for doc,score in sorted_chunks]   
 
 if api_key:
     
@@ -86,92 +86,74 @@ if api_key:
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
         splits = text_splitter.split_documents(documents)
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})    
-
-        contextualize_q_system_prompt=("""
-            Given a chat history and the latest user question which might reference context in the chat history, 
-            formulate a standalone question which can be understood without the chat history. Do NOT answer the question, 
-            just reformulate it if needed and otherwise return it as is.
-        """)
-
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", contextualize_q_system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-        )
+        vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
         
-        history_aware_retriever=create_history_aware_retriever(llm,retriever,contextualize_q_prompt)
-
-
-        system_prompt = ("""
-            You are an assistant for question-answering tasks. 
-            Use the following pieces of retrieved context to answer the question. If you don't know the answer, 
-            say that you don't know. 
-            \n\n
-            {context}
-        """)
-
-        qa_prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ]
-        )
+        bm25_retriever = BM25Retriever.from_documents(splits)
+        bm25_retriever.k = 5
         
-        question_answer_chain=create_stuff_documents_chain(llm,qa_prompt)
-        rag_chain=create_retrieval_chain(history_aware_retriever,question_answer_chain)
+        hybrid_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, vector_retriever],
+            weights=[0.3, 0.7]
+        )    
+
+        
+        system_prompt = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, say that you don't know. 
+
+{context}"""
 
         def get_session_history(session:str)->BaseChatMessageHistory:
             if session_id not in st.session_state.store:
                 st.session_state.store[session_id]=ChatMessageHistory()
             return st.session_state.store[session_id]
-        
-        conversational_rag_chain=RunnableWithMessageHistory(
-            rag_chain,get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
 
         user_input = st.text_input("Your question:")
-        llm_tool=llm.with_structured_output(QueryVariations)
-
-        prompt = f"""Generate 3 different variations of the following query: {user_input}
-        that would help retrieve relevant information from the documents .
-        Return 3 alternative that approach the same question from differnet angles.    
-        """
-        response=llm_tool.invoke(prompt)
-        query_variations=response.queries
-        all_retrieval_results=[]
-        for i,query in enumerate(query_variations,1):
-            docs=retriever.invoke(query)
-            all_retrieval_results.append(docs)
-            
-        fused_results=reciprocal_rank_fusion(all_retrieval_results,k=60,verbose=True)
+        
         if user_input:
+            llm_tool=llm.with_structured_output(QueryVariations)
+            prompt = f"""Generate 3 different variations of the following query: {user_input}
+            that would help retrieve relevant information from the documents.
+            Return 3 alternatives that approach the same question from different angles."""
+            
+            response=llm_tool.invoke(prompt)
+            query_variations=response.queries
+            
+            all_retrieval_results=[]
+            for query in query_variations:
+                docs=hybrid_retriever.invoke(query)
+                all_retrieval_results.append(docs)
+            
+            fused_docs=reciprocal_rank_fusion(all_retrieval_results,k=60)
+            
+            reranker=CohereRerank(model="rerank-english-v3.0",top_n=5)
+            reranked_docs=reranker.compress_documents(documents=fused_docs[:20],query=user_input)
+            
+            context="\n\n".join([doc.page_content for doc in reranked_docs])
             session_history=get_session_history(session_id)
-            response = conversational_rag_chain.invoke(
-                {"input": user_input},
-                config={
-                    "configurable": {"session_id":session_id}
-                },  
-            )
             
-            st.write("Assistant:", response['answer'])
+            messages=[("system",system_prompt.format(context=context))]
             
+            for msg in session_history.messages:
+                if msg.type=="human":
+                    messages.append(("human",msg.content))
+                elif msg.type=="ai":
+                    messages.append(("assistant",msg.content))
+            
+            messages.append(("human",user_input))
+            
+            answer=llm.invoke(messages)
+            
+            session_history.add_user_message(user_input)
+            session_history.add_ai_message(answer.content)
+            
+            st.write("Assistant:",answer.content)
+            
+            with st.expander("View Sources"):
+                for i,doc in enumerate(reranked_docs,1):
+                    st.write(f"**Source {i}:**")
+                    st.write(doc.page_content[:200]+"...")
+
 
 else:
     st.warning("Please enter the Groq API Key")
-
-
-
-
-
-
-
-
 
 
