@@ -5,8 +5,9 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_groq import ChatGroq
 from langchain_cohere import CohereEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_classic.retrievers import BM25Retriever, EnsembleRetriever
+from unstructured.partition.auto import partition
+from langchain_core.documents import Document
 from langchain_cohere import CohereRerank
 import os
 from collections import defaultdict
@@ -28,7 +29,7 @@ class QueryVariations(BaseModel):
     queries: List[str]
 
 st.title("RAG app") 
-st.write("Upload Pdf's and chat with their content")
+st.write("Upload documents and chat with their content")
 
 api_key=os.getenv("GROQ_API_KEY")
 
@@ -63,24 +64,36 @@ if api_key:
     
     llm=ChatGroq(groq_api_key=api_key,model_name="llama-3.1-8b-instant")
 
-    session_id=st.text_input("Session ID",value="default_session")
+    session_id=st.sidebar.text_input("Session ID",value="default_session")
 
     if 'store' not in st.session_state:
         st.session_state.store={}
 
-    uploaded_files=st.file_uploader("Choose A PDf file",type="pdf",accept_multiple_files=True)
+    uploaded_files=st.file_uploader("Choose files",type=["pdf","docx","doc","txt","png","jpg","jpeg"],accept_multiple_files=True)
     
     if uploaded_files:
         documents=[]
         for uploaded_file in uploaded_files:
-            temppdf=f"./temp.pdf"
-            with open(temppdf,"wb") as file:
+            file_extension=uploaded_file.name.split(".")[-1]
+            temp_path=f"./temp_file.{file_extension}"
+            with open(temp_path,"wb") as file:
                 file.write(uploaded_file.getvalue())
-                file_name=uploaded_file.name
-
-            loader=PyPDFLoader(temppdf)
-            docs=loader.load()
-            documents.extend(docs)
+            
+            elements=partition(
+                filename=temp_path,
+                strategy="fast",
+                extract_images_in_pdf=True,
+                extract_image_block_types=["Image","Table"],
+                extract_image_block_to_payload=True,
+                infer_table_structure=True
+            )
+            
+            for element in elements:
+                content=element.metadata.text_as_html if hasattr(element.metadata,"text_as_html") and element.metadata.text_as_html else str(element)
+                if hasattr(element.metadata,"image_base64") and element.metadata.image_base64:
+                    content=f"[Image: {element.metadata.image_base64[:100]}...]"
+                doc=Document(page_content=content,metadata={"source":uploaded_file.name})
+                documents.append(doc)
 
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
@@ -97,9 +110,10 @@ if api_key:
         )    
 
         
-        system_prompt = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, say that you don't know. 
-
-{context}"""
+        system_prompt = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. 
+            If you don't know the answer, say that you don't know. 
+            {context}
+        """
 
         def get_session_history(session:str)->BaseChatMessageHistory:
             if session_id not in st.session_state.store:
