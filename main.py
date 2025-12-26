@@ -94,6 +94,9 @@ if api_key:
                     content=f"[Image: {element.metadata.image_base64[:100]}...]"
                 doc=Document(page_content=content,metadata={"source":uploaded_file.name})
                 documents.append(doc)
+            
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
